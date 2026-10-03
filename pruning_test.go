@@ -34,7 +34,7 @@ func TestColumnPruningIsByteLevel(t *testing.T) {
 
 	run := func(name string, opts ScanOptions) *countingReaderAt {
 		cr := &countingReaderAt{data: raw}
-		rd, err := openSegmentReaderAt(cr, int64(len(raw)), meta, schema)
+		rd, err := openSegmentReaderAt(cr, int64(len(raw)), meta, schema, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

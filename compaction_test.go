@@ -184,6 +184,80 @@ func TestCompactionCrashAfterSwapRecovery(t *testing.T) {
 	}
 }
 
+// TestCompactionCrashAfterCommitBeforeSwap 覆盖崩溃窗口 b：新合并段已经
+// 完整落盘（rename 完成）、但清单还没来得及交换时进程被杀。重启后必须
+// 完整回到合并前：旧段全部存活、数据不丢不重、无主的新段被清理。
+func TestCompactionCrashAfterCommitBeforeSwap(t *testing.T) {
+	biz := "小文件合并-新段落盘后交换前崩溃的恢复"
+	dir := t.TempDir()
+	s := mustCreate(t, dir, compactSchema(), Options{FlushThreshold: 100, CompactionMinSegments: 2})
+	ctx := context.Background()
+	writeNFlush(t, s, 4)
+	oldNames := fileNamesOf(s.m.Segments)
+
+	s.SetFailPoint("compactFailAfterCommit", true)
+	err := s.Compact(ctx)
+	logCase(t, biz, "注入新段落盘后、交换前崩溃", "4 segs, new segment durable", err)
+	if err == nil {
+		t.Fatal("expected injected error")
+	}
+	// 崩溃现场：清单仍是旧版（4 段），磁盘上多出一个无主的新合并段
+	if s.SegmentCount() != 4 {
+		t.Fatalf("manifest must still reference 4 old segments, got %d", s.SegmentCount())
+	}
+	entries, _ := os.ReadDir(dir)
+	orphans := 0
+	for _, e := range entries {
+		if isSegmentFileName(e.Name()) {
+			orphans++
+		}
+	}
+	logCase(t, biz, "崩溃现场磁盘段文件数", "4 旧段 + 1 无主新段", orphans)
+	if orphans != 5 {
+		t.Fatalf("want 4 live + 1 orphan segment files, got %d", orphans)
+	}
+
+	// 重启：无主新段被清理，完整回到合并前
+	s2 := mustOpen(t, dir, Options{FlushThreshold: 100, CompactionMinSegments: 2})
+	rows := scanAll(t, s2, ScanOptions{})
+	logCase(t, biz, "重启后数据完整不丢不重", "1..4", idsOf(rows))
+	if !int64SliceEq(idsOf(rows), []int64{1, 2, 3, 4}) {
+		t.Fatalf("recovered data wrong: %v", idsOf(rows))
+	}
+	if s2.SegmentCount() != 4 {
+		t.Fatalf("want 4 segments after recovery, got %d", s2.SegmentCount())
+	}
+	entries, _ = os.ReadDir(dir)
+	var remain []string
+	for _, e := range entries {
+		if isSegmentFileName(e.Name()) {
+			remain = append(remain, e.Name())
+		}
+	}
+	logCase(t, biz, "无主新段已清理", "只剩 4 个旧段", remain)
+	if len(remain) != 4 {
+		t.Fatalf("orphan segment not cleaned: %v", remain)
+	}
+	for _, n := range oldNames {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Fatalf("old segment %s must survive: %v", n, err)
+		}
+	}
+
+	// 恢复后合并可重试并成功
+	if err := s2.Compact(ctx); err != nil {
+		t.Fatalf("compaction after recovery failed: %v", err)
+	}
+	rows = scanAll(t, s2, ScanOptions{})
+	logCase(t, biz, "恢复后重试合并", "compact retry", idsOf(rows))
+	if s2.SegmentCount() != 1 || !int64SliceEq(idsOf(rows), []int64{1, 2, 3, 4}) {
+		t.Fatalf("retry compaction wrong: segs=%d ids=%v", s2.SegmentCount(), idsOf(rows))
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReopenKeepsData(t *testing.T) {
 	biz := "小文件合并-持久化重开"
 	dir := t.TempDir()

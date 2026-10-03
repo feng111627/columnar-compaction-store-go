@@ -67,10 +67,14 @@ func Create(dir string, schema Schema, opt Options) (*Store, error) {
 		return nil, fmt.Errorf("columnar: store already exists at %s", dir)
 	}
 	schema.Version = 1
+	for i := range schema.Columns {
+		schema.Columns[i].ID = i + 1 // 初始列依次分配生命周期 ID
+	}
 	m := &manifest{
 		Version:       1,
 		SchemaHistory: []Schema{schema},
 		NextSegmentID: 1,
+		NextColumnID:  len(schema.Columns) + 1,
 	}
 	if err := saveManifest(dir, m); err != nil {
 		return nil, err
@@ -224,6 +228,15 @@ func (s *Store) commitSchemaLocked(next Schema) error {
 	if err := validateSchemaShape(next); err != nil {
 		return err
 	}
+	nextColID := s.m.NextColumnID
+	if nextColID == 0 {
+		nextColID = 1 // 兼容手工构造的清单
+	}
+	for _, c := range next.Columns {
+		if c.ID >= nextColID {
+			nextColID = c.ID + 1
+		}
+	}
 	newHist := make([]Schema, 0, len(s.m.SchemaHistory)+1)
 	newHist = append(newHist, s.m.SchemaHistory...)
 	newHist = append(newHist, next)
@@ -232,6 +245,7 @@ func (s *Store) commitSchemaLocked(next Schema) error {
 		SchemaHistory: newHist,
 		Segments:      s.m.Segments,
 		NextSegmentID: s.m.NextSegmentID,
+		NextColumnID:  nextColID,
 	}
 	if err := saveManifest(s.dir, cand); err != nil {
 		return err
@@ -240,14 +254,16 @@ func (s *Store) commitSchemaLocked(next Schema) error {
 	return nil
 }
 
-// pinSnapshot 冻结当前段清单、结构与内存缓冲，并登记一个读引用
-// （扫描器 Close 时 releaseReader 释放）。
-func (s *Store) pinSnapshot() ([]segmentMeta, Schema, []Row) {
+// pinSnapshot 冻结当前段清单、结构、结构历史与内存缓冲，并登记一个读引用
+// （扫描器 Close 时 releaseReader 释放）。结构历史只增不改，浅拷贝切片即可。
+func (s *Store) pinSnapshot() ([]segmentMeta, Schema, []Schema, []Row) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	metas := make([]segmentMeta, len(s.m.Segments))
 	copy(metas, s.m.Segments)
 	schema := *s.m.currentSchema()
+	hist := make([]Schema, len(s.m.SchemaHistory))
+	copy(hist, s.m.SchemaHistory)
 	rows := make([]Row, len(s.buf))
 	for i, r := range s.buf {
 		cp := make(Row, len(r))
@@ -257,7 +273,7 @@ func (s *Store) pinSnapshot() ([]segmentMeta, Schema, []Row) {
 		rows[i] = cp
 	}
 	s.readers.Add(1)
-	return metas, schema, rows
+	return metas, schema, hist, rows
 }
 
 func (s *Store) releaseReader() { s.readers.Done() }

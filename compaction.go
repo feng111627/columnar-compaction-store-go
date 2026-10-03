@@ -15,9 +15,14 @@ import (
 //     取快照，因此要么看到旧段集合、要么看到新段集合，绝不会看到半截。
 //  3. 交换之后先等待所有持旧快照的扫描器 Close（readers.Wait），
 //     才删除旧段文件，保证进行中的读不会碰到被删文件。
-//  4. 交换前任一步骤失败：删除新段文件、内存与磁盘清单都保持旧状态，
-//     完成回滚；交换后若进程崩溃，重启时清单只引用新段，旧段作为
-//     "无主段"由 cleanCrashArtifacts 清理，状态依旧一致。
+//  4. 崩溃窗口覆盖（重启后都必须回到一致状态，由 cleanCrashArtifacts 完成）：
+//     a. 新段写完之前（.tmp 阶段）：临时文件被清理，状态=合并前；
+//     b. 新段已完整落盘、清单尚未交换（failpoint compactFailAfterCommit）：
+//        清单仍引用旧段，新段是无主文件被清理，状态=合并前；
+//     c. 清单已交换、旧段未及删除（failpoint compactFailAfterSwap）：
+//        清单只引用新段，旧段是无主文件被清理，状态=合并后；
+//     交换前任一步骤失败同样回滚（删除新段、清单保持旧状态）。
+//     三个窗口都不会出现行数对不上、半截数据或重复行。
 
 // Compact 执行一次小文件合并。
 func (s *Store) Compact(ctx context.Context) error {
@@ -64,7 +69,7 @@ func (s *Store) compactLocked(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rd, err := openSegment(s.dir, meta, schema)
+		rd, err := openSegment(s.dir, meta, schema, s.m.SchemaHistory)
 		if err != nil {
 			return err
 		}
@@ -96,6 +101,13 @@ func (s *Store) compactLocked(ctx context.Context) error {
 		return errInjected("rowCountMismatch")
 	}
 
+	// 故障注入点：新段文件已完整落盘（.tmp -> rename 完成）、但清单尚未
+	// 交换时进程被杀。模拟方式：直接返回；新段作为"无主段"留在磁盘上，
+	// 清单仍是旧版，重启时由 cleanCrashArtifacts 清理，整体回到合并前。
+	if s.failPointOn("compactFailAfterCommit") {
+		return errInjected("compactFailAfterCommit")
+	}
+
 	// 构造交换后的清单：移除被合并段、追加新段，行数保持不变。
 	remove := map[int64]bool{}
 	for _, meta := range picked {
@@ -118,6 +130,7 @@ func (s *Store) compactLocked(ctx context.Context) error {
 		SchemaHistory: s.m.SchemaHistory,
 		Segments:      newSegs,
 		NextSegmentID: newID + 1,
+		NextColumnID:  s.m.NextColumnID,
 	}
 
 	// 原子持久化新清单；失败则回滚（删除新段，保留旧清单与旧段）。

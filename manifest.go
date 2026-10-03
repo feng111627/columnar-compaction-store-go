@@ -15,6 +15,7 @@ type manifest struct {
 	SchemaHistory []Schema      `json:"schema_history"` // 全部历史结构（旧段解码用）
 	Segments      []segmentMeta `json:"segments"`       // 当前存活段（按写入先后有序）
 	NextSegmentID int64         `json:"next_segment_id"`
+	NextColumnID  int           `json:"next_column_id,omitempty"` // 下一个待分配的列生命周期 ID
 }
 
 func (m *manifest) currentSchema() *Schema {
@@ -25,7 +26,12 @@ func (m *manifest) currentSchema() *Schema {
 }
 
 func (m *manifest) schemaAt(version int) (Schema, bool) {
-	for _, sch := range m.SchemaHistory {
+	return schemaAtVersion(m.SchemaHistory, version)
+}
+
+// schemaAtVersion 在历史里查找指定版本的结构快照。
+func schemaAtVersion(hist []Schema, version int) (Schema, bool) {
+	for _, sch := range hist {
 		if sch.Version == version {
 			return sch, true
 		}
@@ -65,6 +71,7 @@ func (m *manifest) validate() error {
 		}
 		lastVer = sch.Version
 		names := map[string]bool{}
+		ids := map[int]bool{}
 		for _, c := range sch.Columns {
 			if c.Name == "" || c.Type == TypeInvalid {
 				return fmt.Errorf("%w: invalid column in schema v%d", ErrManifestCorrupt, sch.Version)
@@ -73,6 +80,15 @@ func (m *manifest) validate() error {
 				return fmt.Errorf("%w: duplicate column %q in schema v%d", ErrManifestCorrupt, c.Name, sch.Version)
 			}
 			names[c.Name] = true
+			if c.ID < 0 {
+				return fmt.Errorf("%w: negative column id %d in schema v%d", ErrManifestCorrupt, c.ID, sch.Version)
+			}
+			if c.ID != 0 {
+				if ids[c.ID] {
+					return fmt.Errorf("%w: duplicate column id %d in schema v%d", ErrManifestCorrupt, c.ID, sch.Version)
+				}
+				ids[c.ID] = true
+			}
 		}
 	}
 	segIDs := map[int64]bool{}

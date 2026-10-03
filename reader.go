@@ -10,6 +10,7 @@ import (
 type snapshotScanner struct {
 	store  *Store
 	schema Schema
+	hist   []Schema // 快照时刻的结构历史（列身份解析用）
 	metas  []segmentMeta
 	buf    []Row // 快照时刻尚未落盘的内存行
 	opts   ScanOptions
@@ -30,10 +31,11 @@ func (s *Store) Scan(ctx context.Context, opts ScanOptions) (Scanner, error) {
 	if err := s.validateScanOptions(opts); err != nil {
 		return nil, err
 	}
-	metas, schema, buf := s.pinSnapshot()
+	metas, schema, hist, buf := s.pinSnapshot()
 	sc := &snapshotScanner{
 		store:  s,
 		schema: schema,
+		hist:   hist,
 		metas:  metas,
 		buf:    buf,
 		opts:   opts,
@@ -73,7 +75,7 @@ func (sc *snapshotScanner) load(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rd, err := openSegment(sc.store.dir, meta, sc.schema)
+		rd, err := openSegment(sc.store.dir, meta, sc.schema, sc.hist)
 		if err != nil {
 			return err
 		}

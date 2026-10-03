@@ -29,9 +29,22 @@ func (t DataType) String() string {
 
 // Column 列定义。
 type Column struct {
+	// ID 列的生命周期身份：创建时分配，改名不变；删除后同名重建会分配新 ID。
+	// 0 表示未分配（仅出现在手工构造的清单里，此时读取退回按名称匹配）。
+	ID       int
 	Name     string
 	Nullable bool
 	Type     DataType
+}
+
+// columnByID 按生命周期 ID 查找列，找不到时 ok=false。
+func (s *Schema) columnByID(id int) (Column, bool) {
+	for i := range s.Columns {
+		if s.Columns[i].ID == id {
+			return s.Columns[i], true
+		}
+	}
+	return Column{}, false
 }
 
 // Schema 表结构快照，带单调递增的版本号。
