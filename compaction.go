@@ -52,19 +52,27 @@ func (s *Store) compactLocked(ctx context.Context) error {
 		return err
 	}
 	committed := false
+	simulatedCrash := false
 	defer func() {
-		if !committed {
+		// 模拟"进程被杀"时清理 defer 根本不会执行：simulatedCrash 下
+		// 故意把临时段留在磁盘，交由重启时的 cleanCrashArtifacts 处理。
+		if !committed && !simulatedCrash {
 			_ = sw.Close()
 			_ = os.Remove(sw.tmpPath())
 		}
 	}()
 
 	totalRows := 0
+	mergedRows := make([]Row, 0)
 	for _, meta := range picked {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rd, err := openSegment(s.dir, meta, schema)
+		writeSchema, ok := s.m.schemaAt(meta.SchemaVersion)
+		if !ok {
+			return errInjected("missingSchemaVersion")
+		}
+		rd, err := openSegment(s.dir, meta, writeSchema, schema)
 		if err != nil {
 			return err
 		}
@@ -78,7 +86,20 @@ func (s *Store) compactLocked(ctx context.Context) error {
 				return err
 			}
 		}
+		mergedRows = append(mergedRows, rows...)
 		totalRows += len(rows)
+	}
+
+	// 故障注入点：新段数据已写入 .tmp 并 fsync，但在 rename 之前"进程被杀"。
+	// 与优雅失败不同：临时文件留在磁盘上，重启时必须被清理并完整回到合并前。
+	if s.failPointOn("compactFailTmpFsynced") {
+		if sw.tmp != nil {
+			_ = sw.tmp.Sync()
+			_ = sw.tmp.Close()
+			sw.tmp = nil
+		}
+		simulatedCrash = true
+		return errInjected("compactFailTmpFsynced")
 	}
 
 	// 故障注入点：新段写完、清单交换之前失败（用于验证回滚）。
@@ -94,6 +115,13 @@ func (s *Store) compactLocked(ctx context.Context) error {
 		// 理论上不可能发生，发生即视为损坏，回滚。
 		_ = os.Remove(filepath.Join(s.dir, newName))
 		return errInjected("rowCountMismatch")
+	}
+
+	// 故障注入点：新合并段已经完整落盘并 rename 成正式文件名、但清单尚未
+	// 交换时"进程被杀"。此刻磁盘上新旧段并存、清单仍只引用旧段；
+	// 重启恢复必须完整回到合并前：新段作为无主段被清理，行数不增不减。
+	if s.failPointOn("compactFailAfterDataPublish") {
+		return errInjected("compactFailAfterDataPublish")
 	}
 
 	// 构造交换后的清单：移除被合并段、追加新段，行数保持不变。
@@ -112,12 +140,14 @@ func (s *Store) compactLocked(ctx context.Context) error {
 		FileName:      newName,
 		RowCount:      n,
 		SchemaVersion: schema.Version,
+		Stats:         buildSegmentStats(mergedRows, schema),
 	})
 	cand := &manifest{
 		Version:       s.m.Version + 1,
 		SchemaHistory: s.m.SchemaHistory,
 		Segments:      newSegs,
 		NextSegmentID: newID + 1,
+		NextColumnID:  s.m.NextColumnID,
 	}
 
 	// 原子持久化新清单；失败则回滚（删除新段，保留旧清单与旧段）。

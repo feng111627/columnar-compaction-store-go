@@ -2,17 +2,21 @@ package columnar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
+
+var errStatMismatch = errors.New("columnar: segment pruning stats disagree with data")
 
 // snapshotScanner 一致快照扫描器：构造时冻结段清单、结构版本与内存缓冲，
 // 并在 store.readers 登记引用；活动期间 compaction 不会删除它读到的旧段。
 type snapshotScanner struct {
-	store  *Store
-	schema Schema
-	metas  []segmentMeta
-	buf    []Row // 快照时刻尚未落盘的内存行
-	opts   ScanOptions
+	store   *Store
+	schema  Schema
+	history []Schema // 快照时刻的全部结构历史（段身份绑定用）
+	metas   []segmentMeta
+	buf     []Row // 快照时刻尚未落盘的内存行
+	opts    ScanOptions
 
 	rows []Row // 延迟解码后的结果
 	idx  int
@@ -20,6 +24,10 @@ type snapshotScanner struct {
 	loaded bool
 	err    error
 	closed bool
+
+	// 段级跳过的观测计数（loaded 之后有效，测试/观测用）。
+	segmentsConsidered int
+	segmentsSkipped    int
 }
 
 // Scan 打开一个一致快照扫描器，支持列裁剪与过滤下推。
@@ -30,13 +38,14 @@ func (s *Store) Scan(ctx context.Context, opts ScanOptions) (Scanner, error) {
 	if err := s.validateScanOptions(opts); err != nil {
 		return nil, err
 	}
-	metas, schema, buf := s.pinSnapshot()
+	metas, schema, history, buf := s.pinSnapshot()
 	sc := &snapshotScanner{
-		store:  s,
-		schema: schema,
-		metas:  metas,
-		buf:    buf,
-		opts:   opts,
+		store:   s,
+		schema:  schema,
+		history: history,
+		metas:   metas,
+		buf:     buf,
+		opts:    opts,
 	}
 	return sc, nil
 }
@@ -52,50 +61,72 @@ func (s *Store) validateScanOptions(opts ScanOptions) error {
 }
 
 func (sc *snapshotScanner) load(ctx context.Context) error {
-	project := len(sc.opts.Columns) > 0
-	needed := map[string]bool{}
-	if project {
-		for _, c := range sc.opts.Columns {
-			needed[c] = true
-		}
-	} else {
-		for _, c := range sc.schema.Columns {
-			needed[c.Name] = true
-		}
+	// 第一轮：允许段级跳过。若任何已读段的真实数据与其 min/max 依据对不上
+	// （errStatMismatch），立即放弃本轮结果并以完整扫描重跑一次，保证结果
+	// 不比不跳过时少。
+	out, skipped, considered, err := sc.loadSegments(ctx, true)
+	if errors.Is(err, errStatMismatch) {
+		out, skipped, considered, err = sc.loadSegments(ctx, false)
 	}
-	if err := validateFilters(sc.schema, sc.opts.Filters); err != nil {
+	if err != nil {
 		return err
+	}
+	sc.rows = out
+	sc.loaded = true
+	sc.segmentsConsidered = considered
+	sc.segmentsSkipped = skipped
+	return nil
+}
+
+// loadSegments 执行一次完整快照读取。usePruning=true 时带过滤条件的扫描
+// 会先用段级 min/max 依据整段排除不可能命中的段；false 时全部段完整读取
+// （依据不可信时的安全回退路径）。
+func (sc *snapshotScanner) loadSegments(ctx context.Context, usePruning bool) (rows []Row, skipped, considered int, err error) {
+	project := len(sc.opts.Columns) > 0
+	if err := validateFilters(sc.schema, sc.opts.Filters); err != nil {
+		return nil, 0, 0, err
 	}
 
 	var out []Row
 	// 先按段写入先后顺序读磁盘段，再读内存快照行（未刷盘的是最新写入的行）。
 	for _, meta := range sc.metas {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, 0, 0, err
 		}
-		rd, err := openSegment(sc.store.dir, meta, sc.schema)
+		writeSchema, ok := schemaInHistory(sc.history, meta.SchemaVersion)
+		if !ok {
+			// 清单校验保证每个段引用的结构版本都在历史中；走到这里只能是内存状态损坏。
+			return nil, 0, 0, fmt.Errorf("%w: segment %d references unknown schema version %d",
+				ErrManifestCorrupt, meta.ID, meta.SchemaVersion)
+		}
+		considered++
+		statsKey := buildStatsKey(writeSchema, sc.schema)
+		if usePruning && canSkipSegment(meta, writeSchema, sc.schema, statsKey, sc.opts.Filters) {
+			// 依据证明该段不可能命中任何过滤行：段文件完全不打开。
+			skipped++
+			continue
+		}
+		rd, err := openSegment(sc.store.dir, meta, writeSchema, sc.schema)
 		if err != nil {
-			return err
+			return nil, 0, 0, err
 		}
-		segRows, err := rd.scan(ctx, sc.opts)
+		segRows, err := rd.scanWithStatsCheck(ctx, sc.opts, meta, statsKey, usePruning && len(sc.opts.Filters) > 0)
 		_ = rd.close()
 		if err != nil {
-			return err
+			return nil, 0, 0, err
 		}
 		out = append(out, segRows...)
 	}
 	for _, r := range sc.buf {
 		keep, err := filtersMatch(r, sc.opts.Filters)
 		if err != nil {
-			return err
+			return nil, 0, 0, err
 		}
 		if keep {
 			out = append(out, projectRow(r, project, sc.opts.Columns))
 		}
 	}
-	sc.rows = out
-	sc.loaded = true
-	return nil
+	return out, skipped, considered, nil
 }
 
 func (sc *snapshotScanner) Next() (Row, error) {
@@ -126,6 +157,12 @@ func (sc *snapshotScanner) Close() error {
 	sc.closed = true
 	sc.store.releaseReader()
 	return nil
+}
+
+// PruningStats 返回本次扫描考虑的段数与被整段跳过的段数（结果物化后有效）。
+// 主要供测试与观测断言"该跳的确实跳了"。
+func (sc *snapshotScanner) PruningStats() (considered, skipped int) {
+	return sc.segmentsConsidered, sc.segmentsSkipped
 }
 
 // errEOF 返回哨兵 io.EOF（单独函数避免在文件顶部到处 import io）。
@@ -234,6 +271,16 @@ func compareValues(a, b any) (int, error) {
 	default:
 		return 0, fmt.Errorf("%w: cannot compare value of type %T", ErrTypeMismatch, a)
 	}
+}
+
+// schemaInHistory 在结构历史快照中按版本号查找结构。
+func schemaInHistory(history []Schema, version int) (Schema, bool) {
+	for _, sch := range history {
+		if sch.Version == version {
+			return sch, true
+		}
+	}
+	return Schema{}, false
 }
 
 // projectRow 按投影裁剪。project=false 时原样返回。

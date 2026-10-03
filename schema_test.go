@@ -24,7 +24,7 @@ func TestSchemaEvolutionPure(t *testing.T) {
 	biz := "表结构演进-纯函数规则"
 
 	t.Run("新增可空列_版本递增", func(t *testing.T) {
-		next, err := addColumn(baseSchema(), Column{Name: "tag", Type: TypeString, Nullable: true})
+		next, err := addColumn(baseSchema(), Column{Name: "tag", Type: TypeString, Nullable: true}, 100)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -35,7 +35,7 @@ func TestSchemaEvolutionPure(t *testing.T) {
 	})
 
 	t.Run("新增非空列被拒绝", func(t *testing.T) {
-		_, err := addColumn(baseSchema(), Column{Name: "tag", Type: TypeString, Nullable: false})
+		_, err := addColumn(baseSchema(), Column{Name: "tag", Type: TypeString, Nullable: false}, 100)
 		logCase(t, biz, "addColumn(tag NOT nullable)", "tag/string/non-null", err)
 		if !errors.Is(err, ErrIncompatibleSchema) {
 			t.Fatalf("want ErrIncompatibleSchema, got %v", err)
@@ -43,7 +43,7 @@ func TestSchemaEvolutionPure(t *testing.T) {
 	})
 
 	t.Run("新增重名列被拒绝", func(t *testing.T) {
-		_, err := addColumn(baseSchema(), Column{Name: "id", Type: TypeString, Nullable: true})
+		_, err := addColumn(baseSchema(), Column{Name: "id", Type: TypeString, Nullable: true}, 100)
 		logCase(t, biz, "addColumn(duplicate id)", "id", err)
 		if !errors.Is(err, ErrIncompatibleSchema) {
 			t.Fatalf("got %v", err)

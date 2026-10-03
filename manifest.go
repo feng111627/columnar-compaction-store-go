@@ -15,6 +15,7 @@ type manifest struct {
 	SchemaHistory []Schema      `json:"schema_history"` // 全部历史结构（旧段解码用）
 	Segments      []segmentMeta `json:"segments"`       // 当前存活段（按写入先后有序）
 	NextSegmentID int64         `json:"next_segment_id"`
+	NextColumnID  int64         `json:"next_column_id,omitempty"` // 列稳定身份的分配水位
 }
 
 func (m *manifest) currentSchema() *Schema {
@@ -65,6 +66,7 @@ func (m *manifest) validate() error {
 		}
 		lastVer = sch.Version
 		names := map[string]bool{}
+		ids := map[int64]bool{}
 		for _, c := range sch.Columns {
 			if c.Name == "" || c.Type == TypeInvalid {
 				return fmt.Errorf("%w: invalid column in schema v%d", ErrManifestCorrupt, sch.Version)
@@ -73,6 +75,12 @@ func (m *manifest) validate() error {
 				return fmt.Errorf("%w: duplicate column %q in schema v%d", ErrManifestCorrupt, c.Name, sch.Version)
 			}
 			names[c.Name] = true
+			if c.ID != 0 {
+				if ids[c.ID] {
+					return fmt.Errorf("%w: duplicate column id %d in schema v%d", ErrManifestCorrupt, c.ID, sch.Version)
+				}
+				ids[c.ID] = true
+			}
 		}
 	}
 	segIDs := map[int64]bool{}

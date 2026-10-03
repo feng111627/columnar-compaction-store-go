@@ -129,12 +129,14 @@ func (s *Store) flushLocked(ctx context.Context) error {
 		FileName:      finalName,
 		RowCount:      n,
 		SchemaVersion: schema.Version,
+		Stats:         buildSegmentStats(s.buf, schema),
 	})
 	cand := &manifest{
 		Version:       s.m.Version + 1,
 		SchemaHistory: s.m.SchemaHistory,
 		Segments:      segs,
 		NextSegmentID: id + 1,
+		NextColumnID:  s.m.NextColumnID,
 	}
 	if err := saveManifest(s.dir, cand); err != nil {
 		_ = os.Remove(filepath.Join(s.dir, finalName))

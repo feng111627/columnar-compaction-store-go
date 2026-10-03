@@ -28,7 +28,14 @@ func (t DataType) String() string {
 }
 
 // Column 列定义。
+//
+// ID 是列的"生命周期身份"，在列首次出现时分配并在列的整个生命周期内保持
+// 不变；改名（RenameColumn）沿用同一个 ID，因此历史段里的旧名字节仍归属
+// 新名字。列被删除后若用同名重新 AddColumn，会分配一个全新的 ID，旧段里
+// 的同名字节从此与新列无关，旧行在新列上读出 NULL。
+// ID==0 只出现在旧版本清单（升级前的数据）中，读取时回退为按列名绑定。
 type Column struct {
+	ID       int64
 	Name     string
 	Nullable bool
 	Type     DataType

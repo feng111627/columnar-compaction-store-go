@@ -67,10 +67,15 @@ func Create(dir string, schema Schema, opt Options) (*Store, error) {
 		return nil, fmt.Errorf("columnar: store already exists at %s", dir)
 	}
 	schema.Version = 1
+	// 为初始列分配生命周期身份。
+	for i := range schema.Columns {
+		schema.Columns[i].ID = int64(i + 1)
+	}
 	m := &manifest{
 		Version:       1,
 		SchemaHistory: []Schema{schema},
 		NextSegmentID: 1,
+		NextColumnID:  int64(len(schema.Columns) + 1),
 	}
 	if err := saveManifest(dir, m); err != nil {
 		return nil, err
@@ -94,6 +99,7 @@ func openExisting(dir string, opt Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	repairLegacyColumnIDs(m)
 	for _, seg := range m.Segments {
 		if _, err := os.Stat(filepath.Join(dir, seg.FileName)); err != nil {
 			return nil, fmt.Errorf("%w: segment %s referenced by manifest is missing: %v",
@@ -149,6 +155,28 @@ func cleanCrashArtifacts(dir string) error {
 
 func isSegmentFileName(name string) bool {
 	return strings.HasPrefix(name, "seg-") && strings.HasSuffix(name, ".ccs")
+}
+
+// repairLegacyColumnIDs 处理"列身份特性上线前"创建的遗留清单：
+//   - 结构里的列都没有 ID（ID==0）：沿用"按列名绑定"的历史读法，不补 ID，
+//     避免与未来真实 ID 冲突；
+//   - 一旦历史中出现过带 ID 的列（新存储或部分演进后的存储），就保证
+//     NextColumnID 水位高于任何已用 ID，使之后 AddColumn 分配的新 ID 不与
+//     现存身份冲突。
+//
+// 纯内存修复，不主动写盘；下一次刷盘/演进/合并保存清单时自然带上水位。
+func repairLegacyColumnIDs(m *manifest) {
+	var maxID int64
+	for _, sch := range m.SchemaHistory {
+		for _, c := range sch.Columns {
+			if c.ID > maxID {
+				maxID = c.ID
+			}
+		}
+	}
+	if m.NextColumnID <= maxID {
+		m.NextColumnID = maxID + 1
+	}
 }
 
 func segmentFileName(id int64) string { return fmt.Sprintf("seg-%010d.ccs", id) }
@@ -232,6 +260,7 @@ func (s *Store) commitSchemaLocked(next Schema) error {
 		SchemaHistory: newHist,
 		Segments:      s.m.Segments,
 		NextSegmentID: s.m.NextSegmentID,
+		NextColumnID:  s.m.NextColumnID,
 	}
 	if err := saveManifest(s.dir, cand); err != nil {
 		return err
@@ -240,14 +269,16 @@ func (s *Store) commitSchemaLocked(next Schema) error {
 	return nil
 }
 
-// pinSnapshot 冻结当前段清单、结构与内存缓冲，并登记一个读引用
+// pinSnapshot 冻结当前段清单、结构历史、当前结构与内存缓冲，并登记一个读引用
 // （扫描器 Close 时 releaseReader 释放）。
-func (s *Store) pinSnapshot() ([]segmentMeta, Schema, []Row) {
+func (s *Store) pinSnapshot() ([]segmentMeta, Schema, []Schema, []Row) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	metas := make([]segmentMeta, len(s.m.Segments))
 	copy(metas, s.m.Segments)
 	schema := *s.m.currentSchema()
+	history := make([]Schema, len(s.m.SchemaHistory))
+	copy(history, s.m.SchemaHistory)
 	rows := make([]Row, len(s.buf))
 	for i, r := range s.buf {
 		cp := make(Row, len(r))
@@ -257,7 +288,7 @@ func (s *Store) pinSnapshot() ([]segmentMeta, Schema, []Row) {
 		rows[i] = cp
 	}
 	s.readers.Add(1)
-	return metas, schema, rows
+	return metas, schema, history, rows
 }
 
 func (s *Store) releaseReader() { s.readers.Done() }

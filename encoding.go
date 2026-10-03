@@ -252,19 +252,22 @@ func openDecoder(ra io.ReaderAt, size int64) (*segmentDecoder, segmentFileHeader
 
 func (d *segmentDecoder) rowCount() int { return d.h.rowCount }
 
-// loadColumns 只加载 wanted 中标记的列。
-//   - 文件里存在、当前结构也存在：校验存储类型可转换到目标类型后解码；
+func (d *segmentDecoder) header() segmentFileHeader { return d.h }
+
+// loadColumns 按帧到当前结构的身份绑定结果，只加载 wanted 中标记的列。
+//   - 绑定到现存列且被需要：校验存储类型可转换到目标类型后解码；
+//   - 未绑定（已删除列 / 同名重生列的旧身份帧）：物理字节不解释、不加载；
 //   - 当前结构有、文件里没有（后增列）：由调用方补 NULL；
 //   - 存储类型无法安全转换：返回 ErrIncompatibleSchema；
 //   - 帧损坏/截断/CRC 错：返回 ErrCorruptData。
-func (d *segmentDecoder) loadColumns(target Schema, wanted map[string]bool) (map[string]*decodedColumn, error) {
+func (d *segmentDecoder) loadColumns(bindings []frameBinding, wanted map[string]bool) (map[string]*decodedColumn, error) {
 	out := make(map[string]*decodedColumn)
-	for _, e := range d.h.dir {
-		tcol, inTarget := target.Column(e.name)
-		if !inTarget {
-			continue // 已删除列：物理数据保留但不加载
+	for i, b := range bindings {
+		e := d.h.dir[i]
+		if !b.bound {
+			continue // 已删除列或同名重生列的旧身份：永不按新列解释
 		}
-		if !wanted[e.name] {
+		if !wanted[b.target.Name] {
 			continue // 列裁剪：该列一帧都不读
 		}
 		frame := make([]byte, e.frameLen)
@@ -285,19 +288,19 @@ func (d *segmentDecoder) loadColumns(target Schema, wanted map[string]bool) (map
 			return nil, corruptf("column %q type disagrees between directory (%s) and frame (%s)",
 				e.name, e.typ, col.typ)
 		}
-		if !canConvert(col.typ, tcol.Type) {
+		if !canConvert(col.typ, b.target.Type) {
 			return nil, fmt.Errorf("%w: column %q stored as %s cannot be read as %s",
-				ErrIncompatibleSchema, e.name, col.typ, tcol.Type)
+				ErrIncompatibleSchema, b.target.Name, col.typ, b.target.Type)
 		}
-		if col.typ != tcol.Type { // int64 -> float64
+		if col.typ != b.target.Type { // int64 -> float64
 			for i, v := range col.vals {
 				if n, ok := v.(int64); ok {
 					col.vals[i] = float64(n)
 				}
 			}
-			col.typ = tcol.Type
+			col.typ = b.target.Type
 		}
-		out[e.name] = col
+		out[b.target.Name] = col
 	}
 	return out, nil
 }
