@@ -98,10 +98,24 @@ func openExisting(dir string, opt Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 老版本清单归一化：回填列生命周期 ID 与 NextColumnID 并原子写回。
+	// 分配规则确定（同名同 ID、按历史顺序编号），崩溃重开重复执行结果一致。
+	if normalizeLegacyManifest(m) {
+		m.Version++
+		if err := saveManifest(dir, m); err != nil {
+			return nil, err
+		}
+	}
 	for _, seg := range m.Segments {
-		if _, err := os.Stat(filepath.Join(dir, seg.FileName)); err != nil {
+		segPath := filepath.Join(dir, seg.FileName)
+		if _, err := os.Stat(segPath); err != nil {
 			return nil, fmt.Errorf("%w: segment %s referenced by manifest is missing: %v",
 				ErrCorruptData, seg.FileName, err)
+		}
+		// 兼容性预检：未来版本写出的段在打开时即以 ErrUnsupportedVersion
+		// 拒绝；损坏检测仍留在扫描阶段（ErrCorruptData），两者严格区分。
+		if err := checkSegmentFormatSupported(segPath); err != nil {
+			return nil, err
 		}
 	}
 	if opt.FlushThreshold <= 0 {

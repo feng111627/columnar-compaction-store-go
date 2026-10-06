@@ -18,6 +18,9 @@ var (
 	ErrSnapshotModified = errors.New("columnar: snapshot invalidated by concurrent schema change")
 	// ErrNotFound 存储目录未初始化。
 	ErrNotFound = errors.New("columnar: store not initialized")
+	// ErrUnsupportedVersion 存储由更新版本的程序写出，当前版本无法兼容读取。
+	// 与 ErrCorruptData（文件被改坏）严格区分：打开时即报，绝不拖到读取时。
+	ErrUnsupportedVersion = errors.New("columnar: unsupported storage version")
 	// ErrClosed 存储已关闭。
 	ErrClosed = errors.New("columnar: store closed")
 )

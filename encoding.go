@@ -8,13 +8,15 @@ import (
 	"hash/crc32"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
 )
 
 // 列式数据文件格式（全部整数为大端）：
 //
 //	固定头(16 字节):
 //	  magic[4]="CCS1" | version u16 | schemaVersion u32 | rowCount u32 | nCols u16
-//	统计块（段级跳过的依据，与数据同文件、同生命周期）:
+//	统计块（version >= 2 才有；段级跳过的依据，与数据同文件、同生命周期）:
 //	  statsLen u32 | statsPayload | crc u32   crc 覆盖 statsPayload
 //	列目录（nCols 项，使读取方可以不碰未用列的数据帧）:
 //	  nameLen u8 | name bytes | type u8 | frameLen u32
@@ -29,10 +31,20 @@ import (
 // 目录给出每帧长度，读取时按偏移直接读取所需列，实现真正的列裁剪；
 // CRC、长度与类型交叉校验保证任何字节损坏/截断都以 ErrCorruptData 暴露。
 // 统计块损坏不算数据损坏：读取方静默退回完整扫描（见 stats.go）。
+//
+// 版本兼容：
+//   - v1（升级前版本写出）：固定头之后直接是列目录，没有统计块。
+//     读取时按 statsLen=0 处理，过滤扫描自动退回完整扫描，结果不变。
+//   - v2：当前写入版本，带统计块。
+//   - 更高版本（未来版本写出）：打开存储时即以 ErrUnsupportedVersion 拒绝，
+//     与文件损坏（ErrCorruptData）严格区分，绝不拖到读取时才报。
 
 const segmentMagic = "CCS1"
 
-// segmentFormatVersion 当前格式版本。v2 起固定头后多了统计块。
+// segmentFormatVersionV1 升级前版本写出的段格式：无统计块。
+const segmentFormatVersionV1 uint16 = 1
+
+// segmentFormatVersion 当前写入的格式版本。v2 起固定头后多了统计块。
 const segmentFormatVersion uint16 = 2
 
 var crcTable = crc32.MakeTable(crc32.IEEE)
@@ -206,8 +218,14 @@ func openDecoder(ra io.ReaderAt, size int64) (*segmentDecoder, segmentFileHeader
 		return nil, segmentFileHeader{}, fmt.Errorf("%w: bad magic %q", ErrCorruptData, string(head[0:4]))
 	}
 	version := binary.BigEndian.Uint16(head[4:6])
-	if version != segmentFormatVersion {
-		return nil, segmentFileHeader{}, fmt.Errorf("%w: unsupported format version %d", ErrCorruptData, version)
+	if version == 0 {
+		// 任何已发布版本都不会写出 0：魔数正确而版本为 0 只能来自字节损坏。
+		return nil, segmentFileHeader{}, fmt.Errorf("%w: invalid format version 0", ErrCorruptData)
+	}
+	if version > segmentFormatVersion {
+		// 未来版本写出的文件：明确的不兼容，不是损坏。
+		return nil, segmentFileHeader{}, fmt.Errorf("%w: segment format version %d exceeds supported %d",
+			ErrUnsupportedVersion, version, segmentFormatVersion)
 	}
 	nCols := int(binary.BigEndian.Uint16(head[14:16]))
 	h := segmentFileHeader{
@@ -216,16 +234,24 @@ func openDecoder(ra io.ReaderAt, size int64) (*segmentDecoder, segmentFileHeader
 		rowCount:      int(binary.BigEndian.Uint32(head[10:14])),
 	}
 
-	// 统计块：只读长度定位目录，payload 延迟到需要过滤跳过时再解析。
-	var slb [4]byte
-	if err := readFullAt(ra, slb[:], segmentFixedHeaderLen); err != nil {
-		return nil, segmentFileHeader{}, corruptf("stats length: %v", err)
-	}
-	statsLen := int(binary.BigEndian.Uint32(slb[:]))
-	statsOff := int64(segmentFixedHeaderLen + 4)
-	pos := statsOff + int64(statsLen) + 4 // payload + crc
-	if pos > size {
-		return nil, segmentFileHeader{}, corruptf("stats block overruns file (end %d, size %d)", pos, size)
+	// 统计块（v2 起）：只读长度定位目录，payload 延迟到需要过滤跳过时再解析。
+	// v1 文件没有统计块，目录紧跟固定头，按 statsLen=0 处理（过滤时退回全扫）。
+	var statsOff int64
+	var statsLen int
+	var pos int64
+	if version >= 2 {
+		var slb [4]byte
+		if err := readFullAt(ra, slb[:], segmentFixedHeaderLen); err != nil {
+			return nil, segmentFileHeader{}, corruptf("stats length: %v", err)
+		}
+		statsLen = int(binary.BigEndian.Uint32(slb[:]))
+		statsOff = int64(segmentFixedHeaderLen + 4)
+		pos = statsOff + int64(statsLen) + 4 // payload + crc
+		if pos > size {
+			return nil, segmentFileHeader{}, corruptf("stats block overruns file (end %d, size %d)", pos, size)
+		}
+	} else {
+		pos = segmentFixedHeaderLen
 	}
 
 	h.dir = make([]dirEntry, 0, nCols)
@@ -431,6 +457,33 @@ func decodeValue(r *bytes.Reader, colName string, t DataType) (any, error) {
 	default:
 		return nil, corruptf("column %q unknown stored type %d", colName, t)
 	}
+}
+
+// checkSegmentFormatSupported 打开存储时的兼容性预检：只读段文件固定头，
+// 确认其格式版本是当前程序能读的（v1/v2）。
+//   - 版本高于当前写入版本：返回 ErrUnsupportedVersion（未来版本写出的文件，
+//     明确不兼容，打开时即报，绝不拖到扫描时、也绝不伪装成数据损坏）；
+//   - 魔数错误、文件过短、读取失败等：这里不报错，留给扫描时按
+//     ErrCorruptData 正常暴露（损坏检测的既有行为不变）。
+func checkSegmentFormatSupported(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var head [segmentFixedHeaderLen]byte
+	if _, err := io.ReadFull(f, head[:]); err != nil {
+		return nil // 读不出完整头部：按损坏留给扫描阶段报告
+	}
+	if string(head[0:4]) != segmentMagic {
+		return nil // 魔数不对：按损坏留给扫描阶段报告
+	}
+	version := binary.BigEndian.Uint16(head[4:6])
+	if version > segmentFormatVersion {
+		return fmt.Errorf("%w: segment %s format version %d exceeds supported %d (written by a newer version)",
+			ErrUnsupportedVersion, filepath.Base(path), version, segmentFormatVersion)
+	}
+	return nil
 }
 
 func readFullAt(ra io.ReaderAt, buf []byte, off int64) error {
