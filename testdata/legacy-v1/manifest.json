@@ -1,0 +1,184 @@
+{
+  "version": 11,
+  "schema_history": [
+    {
+      "Version": 1,
+      "Columns": [
+        {
+          "Name": "id",
+          "Nullable": false,
+          "Type": 1
+        },
+        {
+          "Name": "name",
+          "Nullable": false,
+          "Type": 3
+        },
+        {
+          "Name": "score",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "active",
+          "Nullable": false,
+          "Type": 4
+        }
+      ]
+    },
+    {
+      "Version": 2,
+      "Columns": [
+        {
+          "Name": "id",
+          "Nullable": false,
+          "Type": 1
+        },
+        {
+          "Name": "name",
+          "Nullable": false,
+          "Type": 3
+        },
+        {
+          "Name": "score",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "active",
+          "Nullable": false,
+          "Type": 4
+        },
+        {
+          "Name": "tag",
+          "Nullable": true,
+          "Type": 3
+        }
+      ]
+    },
+    {
+      "Version": 3,
+      "Columns": [
+        {
+          "Name": "id",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "name",
+          "Nullable": false,
+          "Type": 3
+        },
+        {
+          "Name": "score",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "active",
+          "Nullable": false,
+          "Type": 4
+        },
+        {
+          "Name": "tag",
+          "Nullable": true,
+          "Type": 3
+        }
+      ]
+    },
+    {
+      "Version": 4,
+      "Columns": [
+        {
+          "Name": "id",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "name",
+          "Nullable": false,
+          "Type": 3
+        },
+        {
+          "Name": "score",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "active",
+          "Nullable": false,
+          "Type": 4
+        }
+      ]
+    },
+    {
+      "Version": 5,
+      "Columns": [
+        {
+          "Name": "id",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "name",
+          "Nullable": false,
+          "Type": 3
+        },
+        {
+          "Name": "score",
+          "Nullable": false,
+          "Type": 2
+        },
+        {
+          "Name": "active",
+          "Nullable": false,
+          "Type": 4
+        },
+        {
+          "Name": "tag",
+          "Nullable": true,
+          "Type": 3
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "id": 1,
+      "file_name": "seg-0000000001.ccs",
+      "row_count": 10,
+      "schema_version": 1
+    },
+    {
+      "id": 2,
+      "file_name": "seg-0000000002.ccs",
+      "row_count": 10,
+      "schema_version": 1
+    },
+    {
+      "id": 3,
+      "file_name": "seg-0000000003.ccs",
+      "row_count": 5,
+      "schema_version": 1
+    },
+    {
+      "id": 4,
+      "file_name": "seg-0000000004.ccs",
+      "row_count": 10,
+      "schema_version": 2
+    },
+    {
+      "id": 5,
+      "file_name": "seg-0000000005.ccs",
+      "row_count": 10,
+      "schema_version": 3
+    },
+    {
+      "id": 6,
+      "file_name": "seg-0000000006.ccs",
+      "row_count": 10,
+      "schema_version": 5
+    }
+  ],
+  "next_segment_id": 7
+}

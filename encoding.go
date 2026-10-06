@@ -14,7 +14,7 @@ import (
 //
 //	固定头(16 字节):
 //	  magic[4]="CCS1" | version u16 | schemaVersion u32 | rowCount u32 | nCols u16
-//	统计块（段级跳过的依据，与数据同文件、同生命周期）:
+//	统计块（version >= 2 才有；段级跳过的依据，与数据同文件、同生命周期）:
 //	  statsLen u32 | statsPayload | crc u32   crc 覆盖 statsPayload
 //	列目录（nCols 项，使读取方可以不碰未用列的数据帧）:
 //	  nameLen u8 | name bytes | type u8 | frameLen u32
@@ -29,11 +29,19 @@ import (
 // 目录给出每帧长度，读取时按偏移直接读取所需列，实现真正的列裁剪；
 // CRC、长度与类型交叉校验保证任何字节损坏/截断都以 ErrCorruptData 暴露。
 // 统计块损坏不算数据损坏：读取方静默退回完整扫描（见 stats.go）。
+//
+// 版本兼容：v1 是升级前老库写出的格式（固定头后直接是列目录，无统计块），
+// 读取侧完整支持；v2 是当前写出的格式。超出 [v1, v2] 范围的版本号说明文件
+// 来自更新（或无法识别）的实现，报 ErrUnsupportedVersion 而非 ErrCorruptData。
 
 const segmentMagic = "CCS1"
 
-// segmentFormatVersion 当前格式版本。v2 起固定头后多了统计块。
+// segmentFormatVersion 当前写出的格式版本。v2 起固定头后多了统计块。
+// 读取侧同时支持 v1（升级前的老段：固定头后直接是列目录，无统计块）。
 const segmentFormatVersion uint16 = 2
+
+// segmentFormatVersionOldest 读取侧支持的最老格式版本。
+const segmentFormatVersionOldest uint16 = 1
 
 var crcTable = crc32.MakeTable(crc32.IEEE)
 
@@ -194,8 +202,10 @@ type segmentDecoder struct {
 const segmentFixedHeaderLen = 4 + 2 + 4 + 4 + 2
 
 // openDecoder 读取并校验文件头与列目录。
+// 兼容 v1（老库，无统计块）与 v2（带统计块）；其余版本是"本代码无法理解的
+// 内容"，报 ErrUnsupportedVersion（与字节损坏的 ErrCorruptData 严格区分）。
 func openDecoder(ra io.ReaderAt, size int64) (*segmentDecoder, segmentFileHeader, error) {
-	if size < segmentFixedHeaderLen+4 {
+	if size < segmentFixedHeaderLen {
 		return nil, segmentFileHeader{}, fmt.Errorf("%w: file too short (%d bytes)", ErrCorruptData, size)
 	}
 	head := make([]byte, segmentFixedHeaderLen)
@@ -206,8 +216,9 @@ func openDecoder(ra io.ReaderAt, size int64) (*segmentDecoder, segmentFileHeader
 		return nil, segmentFileHeader{}, fmt.Errorf("%w: bad magic %q", ErrCorruptData, string(head[0:4]))
 	}
 	version := binary.BigEndian.Uint16(head[4:6])
-	if version != segmentFormatVersion {
-		return nil, segmentFileHeader{}, fmt.Errorf("%w: unsupported format version %d", ErrCorruptData, version)
+	if version < segmentFormatVersionOldest || version > segmentFormatVersion {
+		return nil, segmentFileHeader{}, fmt.Errorf("%w: %d (this build reads %d..%d)",
+			ErrUnsupportedVersion, version, segmentFormatVersionOldest, segmentFormatVersion)
 	}
 	nCols := int(binary.BigEndian.Uint16(head[14:16]))
 	h := segmentFileHeader{
@@ -216,16 +227,22 @@ func openDecoder(ra io.ReaderAt, size int64) (*segmentDecoder, segmentFileHeader
 		rowCount:      int(binary.BigEndian.Uint32(head[10:14])),
 	}
 
-	// 统计块：只读长度定位目录，payload 延迟到需要过滤跳过时再解析。
-	var slb [4]byte
-	if err := readFullAt(ra, slb[:], segmentFixedHeaderLen); err != nil {
-		return nil, segmentFileHeader{}, corruptf("stats length: %v", err)
-	}
-	statsLen := int(binary.BigEndian.Uint32(slb[:]))
-	statsOff := int64(segmentFixedHeaderLen + 4)
-	pos := statsOff + int64(statsLen) + 4 // payload + crc
-	if pos > size {
-		return nil, segmentFileHeader{}, corruptf("stats block overruns file (end %d, size %d)", pos, size)
+	// 统计块（仅 v2 起存在）：只读长度定位目录，payload 延迟到需要过滤
+	// 跳过时再解析。v1 老段没有统计块，statsLen=0，过滤时自动退回完整扫描。
+	pos := int64(segmentFixedHeaderLen)
+	var statsOff int64
+	var statsLen int
+	if version >= 2 {
+		var slb [4]byte
+		if err := readFullAt(ra, slb[:], pos); err != nil {
+			return nil, segmentFileHeader{}, corruptf("stats length: %v", err)
+		}
+		statsLen = int(binary.BigEndian.Uint32(slb[:]))
+		statsOff = pos + 4
+		pos = statsOff + int64(statsLen) + 4 // payload + crc
+		if pos > size {
+			return nil, segmentFileHeader{}, corruptf("stats block overruns file (end %d, size %d)", pos, size)
+		}
 	}
 
 	h.dir = make([]dirEntry, 0, nCols)

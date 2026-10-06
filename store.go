@@ -98,10 +98,21 @@ func openExisting(dir string, opt Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 升级归一化：老清单（升级前版本所写）没有列生命周期身份，打开时
+	// 一次性补齐并原子落盘。此后改名/删加列都走 ID 语义，老段数据在
+	// 任何读取方式下都能正确归位。归一化只动清单，不碰任何段文件。
+	if m.needsIDNormalization() {
+		m.normalizeColumnIDs()
+		if err := saveManifest(dir, m); err != nil {
+			return nil, fmt.Errorf("columnar: normalize legacy manifest: %w", err)
+		}
+	}
+	// 打开时校验全部存活段的文件头与列目录（不读列帧，开销可忽略）：
+	// 来自更新版本的段报 ErrUnsupportedVersion，头部损坏报 ErrCorruptData，
+	// 两类问题都在打开时清楚地区分暴露，不会拖到扫描中途才失败。
 	for _, seg := range m.Segments {
-		if _, err := os.Stat(filepath.Join(dir, seg.FileName)); err != nil {
-			return nil, fmt.Errorf("%w: segment %s referenced by manifest is missing: %v",
-				ErrCorruptData, seg.FileName, err)
+		if err := validateSegmentFile(filepath.Join(dir, seg.FileName)); err != nil {
+			return nil, err
 		}
 	}
 	if opt.FlushThreshold <= 0 {
@@ -114,6 +125,26 @@ func openExisting(dir string, opt Options) (*Store, error) {
 		failPoints: map[string]bool{},
 	}
 	return s, nil
+}
+
+// validateSegmentFile 校验单个段文件：必须存在、头部与列目录可解析、
+// 格式版本在本代码可读范围内。
+func validateSegmentFile(path string) error {
+	base := filepath.Base(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("%w: segment %s referenced by manifest is missing: %v",
+			ErrCorruptData, base, err)
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: segment %s: %v", ErrCorruptData, base, err)
+	}
+	if _, _, err := openDecoder(f, fi.Size()); err != nil {
+		return fmt.Errorf("segment %s: %w", base, err)
+	}
+	return nil
 }
 
 // cleanCrashArtifacts 删除未提交的临时文件，以及清单里不再引用的旧段

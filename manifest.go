@@ -39,6 +39,63 @@ func schemaAtVersion(hist []Schema, version int) (Schema, bool) {
 	return Schema{}, false
 }
 
+// needsIDNormalization 报告清单是否来自升级前的版本（列没有生命周期身份）：
+// 任一历史结构里存在 ID 为 0 的列，或 NextColumnID 缺失。
+func (m *manifest) needsIDNormalization() bool {
+	if m.NextColumnID <= 0 {
+		return true
+	}
+	for _, sch := range m.SchemaHistory {
+		for _, c := range sch.Columns {
+			if c.ID == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// normalizeColumnIDs 为升级前的清单补列生命周期身份（原地修改，调用方负责
+// 原子持久化）。规则：按结构版本顺序扫描，同名列共享同一个 ID——这精确保持
+// 旧版"按名匹配"的读取语义，老段字节在升级前后的读法完全一致（包括老库
+// 历史上发生过的同名重生）；只有升级之后新发生的删列再加列才会分配全新 ID
+// （走"同名重生旧数据读 NULL"的新语义）。
+func (m *manifest) normalizeColumnIDs() {
+	byName := map[string]int{}
+	next := m.NextColumnID
+	if next <= 0 {
+		next = 1
+	}
+	// 先登记已存在的 ID（防御混合清单：部分列有 ID、部分没有）。
+	for _, sch := range m.SchemaHistory {
+		for _, c := range sch.Columns {
+			if c.ID == 0 {
+				continue
+			}
+			byName[c.Name] = c.ID
+			if c.ID >= next {
+				next = c.ID + 1
+			}
+		}
+	}
+	for i := range m.SchemaHistory {
+		for j := range m.SchemaHistory[i].Columns {
+			c := &m.SchemaHistory[i].Columns[j]
+			if c.ID != 0 {
+				continue
+			}
+			if id, ok := byName[c.Name]; ok {
+				c.ID = id
+				continue
+			}
+			c.ID = next
+			byName[c.Name] = next
+			next++
+		}
+	}
+	m.NextColumnID = next
+}
+
 // loadManifest 读取并校验清单；不存在返回包装了 ErrNotFound 的错误，
 // 损坏（JSON 非法或内容不自洽）返回包装了 ErrManifestCorrupt 的错误。
 func loadManifest(dir string) (*manifest, error) {
